@@ -39,11 +39,12 @@ def turn_json(folder_path, output_file):
             article_number = match.group(1)
             content = match.group(3).strip()
 
-            # 將條號中的 "-" 替換為 "條之"
-            article_number = article_number.replace("-", "條之")
+            if "-" in article_number:
+                article_number = article_number.replace("-", "條之")
+                label = f"{law_name}第{article_number}"
+            else:
+                label = f"{law_name}第{article_number}條"
 
-            # 建立 label
-            label = f"{law_name}第{article_number}條".strip()
             document_pool.append({"label": label, "content": content})
 
     with open(output_file, "w", encoding="utf-8") as outfile:
