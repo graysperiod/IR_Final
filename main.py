@@ -19,7 +19,7 @@ import random
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import login
 
-login(token="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")
+#login(token="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")
 
 # ==== 參數 ====
 TRAIN_DATA_PATH = "train_data.jsonl"  # 訓練資料路徑
