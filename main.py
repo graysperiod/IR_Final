@@ -1,17 +1,21 @@
+import os
+import torch
+#torch.cuda.set_device(2)
+#os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,5" 
+
 import json
 import argparse
-from sentence_transformers import SentenceTransformer, InputExample, util, SentenceTransformerTrainer, SentenceTransformerTrainingArguments
-from sentence_transformers.losses import ContrastiveLoss
+from sentence_transformers import SentenceTransformer, InputExample, util, SentenceTransformerTrainer, SentenceTransformerTrainingArguments, losses
 from torch.utils.data import DataLoader
-import torch
-from tqdm import tqdm
+from sentence_transformers.losses import ContrastiveLoss
 import csv
-import os
 from datasets import Dataset
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 import numpy as np
 import jieba
+import random
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import login
 
@@ -22,32 +26,38 @@ TRAIN_DATA_PATH = "train_data.jsonl"  # 訓練資料路徑
 TEST_DATA_PATH = "test_data.jsonl"  # 測試資料路徑
 REWRITE_TEST_DATA_PATH = "rewrite_test_data.jsonl"  # 測試資料路徑
 DOCUMENTS_PATH = "document_pool.json"  # 法條資料路徑
-MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"#"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"#
+MODEL_NAME = "BAAI/bge-m3"#"sentence-transformers/all-mpnet-base-v2"#"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"#
 RERWITE_MODEL_NAME = "lianghsun/Llama-3.2-Taiwan-Legal-3B-Instruct"
 OUTPUT_MODEL_PATH = "./retrieval_model"  # 訓練後模型儲存路徑
 OUTPUT_FOLDER_PATH = "output/result.csv"
 BATCH_SIZE = 16
 EPOCHS = 1
 
-#os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+
 import nltk
 nltk.download('punkt_tab')
 
+cache_dir = os.path.join(os.getcwd(), "jieba_cache")
+os.makedirs(cache_dir, exist_ok=True)
+jieba.tmp_dir = cache_dir
+
 class Retriever:
-    def __init__(self, model_name, rewrite_llm, device=None):
+    def __init__(self, model_name, rewrite_llm, rewriting=True,device=None):
         self.device = device if device else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = SentenceTransformer(model_name).to(self.device)
-
+        #self.model = torch.nn.DataParallel(self.model, device_ids=[2, 3])
         self.documents = None
         self.hybrid_alpha = 0.5
+        """""
+        if rewriting:
+            self.rewrite_tokenizer = AutoTokenizer.from_pretrained(
+                rewrite_llm, 
+                device_map=self.device
+            )
 
-        self.rewrite_tokenizer = AutoTokenizer.from_pretrained(
-            rewrite_llm, 
-            device_map=self.device
-        )
-
-        self.rewrite_model = AutoModelForCausalLM.from_pretrained(rewrite_llm)
-        self.rewrite_model.eval()
+            self.rewrite_model = AutoModelForCausalLM.from_pretrained(rewrite_llm)
+            self.rewrite_model.eval()
+        """""
     def generate(self, messages, max_tokens):
         text_chat = self.rewrite_tokenizer.apply_chat_template(
             messages,
@@ -125,18 +135,16 @@ class Retriever:
 
         message = self.generate(messages, max_tokens)
         return message
-    def load_train_data(self, train_path, document_path):
+    def load_embedding_train_data(self, train_path, document_path):
         """讀取訓練資料 (jsonl 格式)"""
         sentence1 = []
         sentence2 = []
         label = []
+        examples = []
         with open(train_path, "r", encoding="utf-8") as f:
             for line in f:
                 data = json.loads(line.strip())
-                title = data.get("title", "")
-                question = data.get("question", "")
-                title = title if title is not None else ""
-                question = question if question is not None else ""
+                query = data['question'] if data['question'] is not None else data['title']
                 positives = data["label"].split(",")
                 with open(document_path, "r", encoding="utf-8") as f:
                     documents = json.load(f)
@@ -146,23 +154,59 @@ class Retriever:
                             correspond_doc.append(item["content"])
                 #print(correspond_doc)
                 for positive in correspond_doc:
-                    sentence1.append(title + " " + question)
+                    sentence1.append(query)
                     sentence2.append(positive)
                     label.append(1)
-                    #examples.append(InputExample(texts=[title + " " + question, positive], label=1.0))
+                    examples.append(InputExample(texts=[query, positive], label=1.0))
         train_dataset = Dataset.from_dict({
             "sentence1": sentence1,
             "sentence2": sentence2,
             "label": label,
         })
-        return train_dataset
+        return train_dataset,examples
+    def split_eval_train_data(self, train_path, eval_ratio=0.2):
+        """讀取訓練資料 (jsonl 格式)"""
+        sentence1 = []
+        sentence2 = []
 
+        data_list = [] 
+
+        with open(train_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    data_list.append(data)
+                except json.JSONDecodeError:
+                    continue
+
+        random.shuffle(data_list)
+
+        eval_size = int(len(data_list) * eval_ratio)
+        eval_data = data_list[:eval_size]
+        train_data = data_list[eval_size:]
+    
+
+        return eval_data, train_data
+    def load_test_data(self, test_path):
+        """讀取訓練資料 (jsonl 格式)"""
+        data_list = [] 
+
+        with open(test_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    data_list.append(data)
+                except json.JSONDecodeError:
+                    continue
+    
+
+        return data_list
     def load_documents(self, doc_path):
         """讀取文件池 (json 格式)"""
         with open(doc_path, "r", encoding="utf-8") as f:
             documents = json.load(f)
         self.documents =  {doc["label"]: doc["content"] for doc in documents}
-    def bm_25(self, test_data_path, model_path, output_path, documents_path, top_k=7):
+    def bm_25(self, test_data_path, model_path, output_path, documents_path, evaluate=False, top_k=7):
 
         self.load_documents(documents_path)
         print("Loading model...")
@@ -176,34 +220,36 @@ class Retriever:
         bm25 = BM25Okapi(tokenized_documents)
         bm25.k1 = 1.5  # 或 2.0
         bm25.b = 0.75
+
         print("Retrieving queries...")
-        with open(test_data_path, "r", encoding="utf-8") as f:
-            with open(output_path, mode="w", encoding="utf-8", newline="") as file:
-                writer = csv.writer(file)
-                writer.writerow(["id", "TARGET"])
 
-                for line in f:
-                    data = json.loads(line.strip())
-                    title = data.get("title", "")
-                    question = data.get("question", "")
-                    title = title if title is not None else ""
-                    question = question if question is not None else ""
-                    query = title + " " + question
+        with open(output_path, mode="w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["id", "TARGET"])
 
-                    #print(f"Query: {query}")
-                    tokenized_query = list(jieba.cut(query))
+            for line in test_data_path:
+                data = json.loads(line.strip())
+                title = data.get("title", "")
+                question = data.get("question", "")
+                title = title if title is not None else ""
+                question = question if question is not None else ""
+                query = title + " " + question
 
-                    scores = bm25.get_scores(tokenized_query)
-                    #top_docs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-                    #print("最相關文檔索引：", [doc[0] for doc in top_docs])
-                    top_k_indices = np.argsort(scores)[::-1][:top_k]
-                    #print(top_k_indices)
-                    top_labels = [document_labels[idx] for idx in top_k_indices]
-                    top_labels_string = ", ".join(top_labels)
-                    #print(f"Top labels: {top_labels}")
-                    writer.writerow([data["id"], top_labels_string])
-                print("Finish")
-    def hybrid(self, test_data_path, model_path, output_path, documents_path, top_k=7):
+                #print(f"Query: {query}")
+                tokenized_query = list(jieba.cut(query))
+
+                scores = bm25.get_scores(tokenized_query)
+                #top_docs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+                #print("最相關文檔索引：", [doc[0] for doc in top_docs])
+                top_k_indices = np.argsort(scores)[::-1][:top_k]
+                #print(top_k_indices)
+                top_labels = [document_labels[idx] for idx in top_k_indices]
+                top_labels_string = ", ".join(top_labels)
+                #print(f"Top labels: {top_labels}")
+                writer.writerow([data["id"], top_labels_string])
+            print("Finish")
+    
+    def hybrid(self, test_data, model_path, output_path, documents_path, evaluate=False, top_k=7):
         self.load_documents(documents_path)
         print("Loading model...")
         #self.model = SentenceTransformer(model_path).to(self.device)
@@ -221,13 +267,37 @@ class Retriever:
         bm25.k1 = 1.5  # 或 2.0
         bm25.b = 0.75
         print("Retrieving queries...")
-        with open(test_data_path, "r", encoding="utf-8") as f:
+
+        if evaluate:
+            evaluate_score = 0
+            for data in test_data:
+                title = data.get("title", "")
+                question = data.get("question", "")
+                title = title if title is not None else ""
+                question = question if question is not None else ""
+                query = title + " " + question
+
+                tokenized_query = list(jieba.cut(query))
+
+                scores = bm25.get_scores(tokenized_query)
+                top_k_indices = np.argsort(scores)[::-1][:top_k]
+                top_labels = [document_labels[idx] for idx in top_k_indices]
+                top_labels_string = ", ".join(top_labels)
+
+                label = data.get("label", "")
+                print(f"correct:{label}, guessed: {top_labels_string}")
+                score = self.calculate_f1_score(top_labels_string, label)
+                evaluate_score = evaluate_score+score
+
+            print(f"evaluate_score_total:{evaluate_score}")
+            evaluate_score = evaluate_score/len(test_data)
+            print(f"Score: {evaluate_score}")
+        else:
             with open(output_path, mode="w", encoding="utf-8", newline="") as file:
                 writer = csv.writer(file)
                 writer.writerow(["id", "TARGET"])
 
-                for line in f:
-                    data = json.loads(line.strip())
+                for data in test_data:
                     title = data.get("title", "")
                     question = data.get("question", "")
                     title = title if title is not None else ""
@@ -259,7 +329,7 @@ class Retriever:
                     #print(f"Top labels: {top_labels}")
                     writer.writerow([data["id"], top_labels_string])
                 print("Finish")
-    def rerank(self, test_data_path, model_path, output_path, documents_path, top_first_m=1000, top_k=5):
+    def rerank(self, test_data, model_path, output_path, documents_path, top_first_m=1000, top_k=3):
         self.load_documents(documents_path)
         print("Loading model...")
         #self.model = SentenceTransformer(model_path).to(self.device)
@@ -274,50 +344,34 @@ class Retriever:
         bm25.b = 0.75
         print("Encoding documents...")
         doc_embeddings = self.model.encode(document_contents, convert_to_tensor=True)
+
         
-        token_lengths = [len(self.model.tokenizer.encode(doc)) for doc in document_contents]
+        with open(output_path, mode="w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["id", "TARGET"])
 
-        # 计算平均 token 数量
-        average_token_length = sum(token_lengths) / len(token_lengths)
+            for data in test_data:
+                query = data['question'] if data['question'] is not None else data['title']
+                tokenized_query = list(jieba.cut(query))
 
-        print(f"每个文档的平均 token 数量: {average_token_length}")
-        
-        with open(test_data_path, "r", encoding="utf-8") as f:
-            with open(output_path, mode="w", encoding="utf-8", newline="") as file:
-                writer = csv.writer(file)
-                writer.writerow(["id", "TARGET"])
+                scores = bm25.get_scores(tokenized_query)
 
-                for line in f:
-                    #print("Retrieving queries...")
-                    data = json.loads(line.strip())
-                    title = data.get("title", "")
-                    question = data.get("question", "")
-                    title = title if title is not None else ""
-                    question = question if question is not None else ""
-                    query = title + " " + question
+                top_k_indices = np.argsort(scores)[::-1][:top_first_m]
+                top_k_indices = np.argsort(top_k_indices)
+                #print(top_k_indices)
+                first_retrieve_embeddings = doc_embeddings[top_k_indices]
+                first_retrieve_labels = [document_labels[idx] for idx in top_k_indices]
 
-                    #print(f"Query: {query}")
-                    tokenized_query = list(jieba.cut(query))
-
-                    scores = bm25.get_scores(tokenized_query)
-                    #top_docs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-                    #print("最相關文檔索引：", [doc[0] for doc in top_docs])
-                    top_k_indices = np.argsort(scores)[::-1][:top_first_m]
-                    top_k_indices = np.argsort(top_k_indices)
-                    #print(top_k_indices)
-                    first_retrieve_embeddings = doc_embeddings[top_k_indices]
-                    first_retrieve_labels = [document_labels[idx] for idx in top_k_indices]
-
-                    query_embedding = self.model.encode(query, convert_to_tensor=True)
-                    cos_scores = util.pytorch_cos_sim(query_embedding, first_retrieve_embeddings)[0]
-                    top_results = torch.topk(cos_scores, k=top_k)
-                    #print(top_results)
-                    top_labels = [first_retrieve_labels[idx] for idx in top_results.indices]
-                    top_labels_string = ", ".join(top_labels)
-                    #print(f"Top labels: {top_labels}")
-                    writer.writerow([data["id"], top_labels_string])
-                print("Finish")
-    def rewrite_bm25(self, test_data_path, model_path, output_path, documents_path, top_k=7):
+                query_embedding = self.model.encode(query, convert_to_tensor=True)
+                cos_scores = util.pytorch_cos_sim(query_embedding, first_retrieve_embeddings)[0]
+                top_results = torch.topk(cos_scores, k=top_k)
+                #print(top_results)
+                top_labels = [first_retrieve_labels[idx] for idx in top_results.indices]
+                top_labels_string = ", ".join(top_labels)
+                #print(f"Top labels: {top_labels}")
+                writer.writerow([data["id"], top_labels_string])
+            print("Finish")
+    def rewrite_bm25(self, test_data, model_path, output_path, documents_path, evaluate=False, top_k=7):
         self.load_documents(documents_path)
         print("Loading model...")
         #self.model = SentenceTransformer(model_path).to(self.device)
@@ -331,13 +385,33 @@ class Retriever:
         bm25.k1 = 1.5  # 或 2.0
         bm25.b = 0.75
         print("Retrieving queries...")
-        with open(test_data_path, "r", encoding="utf-8") as f:
+
+        if evaluate:
+            evaluate_score = 0
+            for data in test_data:
+                query = data.get("context", "")
+
+                tokenized_query = list(jieba.cut(query))
+
+                scores = bm25.get_scores(tokenized_query)
+                top_k_indices = np.argsort(scores)[::-1][:top_k]
+                top_labels = [document_labels[idx] for idx in top_k_indices]
+                top_labels_string = ", ".join(top_labels)
+
+                label = data.get("label", "")
+                print(f"correct:{label}, guessed: {top_labels_string}")
+                score = self.calculate_f1_score(top_labels_string, label)
+                evaluate_score = evaluate_score+score
+
+            print(f"evaluate_score_total:{evaluate_score}")
+            evaluate_score = evaluate_score/len(test_data)
+            print(f"Score: {evaluate_score}")
+        else:
             with open(output_path, mode="w", encoding="utf-8", newline="") as file:
                 writer = csv.writer(file)
                 writer.writerow(["id", "TARGET"])
 
-                for line in f:
-                    data = json.loads(line.strip())
+                for data in test_data:
                     query = data.get("context", "")
 
                     #print(f"Query: {query}")
@@ -352,17 +426,32 @@ class Retriever:
                     top_labels_string = ", ".join(top_labels)
                     #print(f"Top labels: {top_labels}")
                     writer.writerow([data["id"], top_labels_string])
+
                 print("Finish")
+
+    def calculate_f1_score(self, output, correct_output):
+        output_set = set(output.split(","))
+        correct_set = set(correct_output.split(","))
+
+        tp = len(output_set & correct_set)
+        fp = len(output_set - correct_set)
+        fn = len(correct_set - output_set)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return f1
     def train(self, train_data_path, output_model_path, document_path, epochs=1, batch_size=32):
         """訓練檢索模型"""
         print("Loading training data...")
-        train_data = self.load_train_data(train_data_path, document_path)
+        train_data, old_train_data = self.load_embedding_train_data(train_data_path, document_path)
         #train_dataloader = DataLoader(train_data, shuffle=True, batch_size=batch_size)
         train_loss = ContrastiveLoss(self.model)
-
-        print("Training model...")
-        print(self.model.device)
         """""
+        train_dataloader = DataLoader(old_train_data, shuffle=True, batch_size=batch_size)
+
         self.model.fit(
             train_objectives=[(train_dataloader, train_loss)],
             epochs=epochs,
@@ -390,9 +479,10 @@ class Retriever:
             args=args
         )
         trainer.train()
+        
         print(f"Model saved to {output_model_path}")
-
-    def retrieve(self, test_data_path, model_path, output_path, documents_path, top_k=5):
+    
+    def retrieve(self, test_data, model_path, output_path, documents_path, evaluate=False, top_k=3):
         self.load_documents(documents_path)
         print("Loading model...")
         #self.model = SentenceTransformer(model_path).to(self.device)
@@ -404,30 +494,26 @@ class Retriever:
         doc_embeddings = self.model.encode(document_contents, convert_to_tensor=True)
 
         print("Retrieving queries...")
-        with open(test_data_path, "r", encoding="utf-8") as f:
-            with open(output_path, mode="w", encoding="utf-8", newline="") as file:
-                writer = csv.writer(file)
-                writer.writerow(["id", "TARGET"])
 
-                for line in f:
-                    data = json.loads(line.strip())
-                    title = data.get("title", "")
-                    question = data.get("question", "")
-                    title = title if title is not None else ""
-                    question = question if question is not None else ""
-                    query = title + " " + question
+        
+        with open(output_path, mode="w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["id", "TARGET"])
 
-                    #print(f"Query: {query}")
-                    query_embedding = self.model.encode(query, convert_to_tensor=True)
+            for data in test_data:
+                query = [data['question'] if data['question'] is not None else data['title']]
 
-                    cos_scores = util.pytorch_cos_sim(query_embedding, doc_embeddings)[0]
-                    top_results = torch.topk(cos_scores, k=top_k)
-                    #print(top_results)
-                    top_labels = [document_labels[idx] for idx in top_results.indices]
-                    top_labels_string = ", ".join(top_labels)
-                    #print(f"Top labels: {top_labels}")
-                    writer.writerow([data["id"], top_labels_string])
-                print("Finish!")
+                #print(f"Query: {query}")
+                query_embedding = self.model.encode(query, convert_to_tensor=True)
+
+                cos_scores = util.pytorch_cos_sim(query_embedding, doc_embeddings)[0]
+                top_results = torch.topk(cos_scores, k=top_k)
+                #print(top_results)
+                top_labels = [document_labels[idx] for idx in top_results.indices]
+                top_labels_string = ", ".join(top_labels)
+                #print(f"Top labels: {top_labels}")
+                writer.writerow([data["id"], top_labels_string])
+            print("Finish!")
     
 def main():
     parser = argparse.ArgumentParser(description="訓練並檢索法律文件相關資料")
@@ -445,8 +531,9 @@ def main():
 
     args = parser.parse_args()
     #torch.cuda.empty_cache()
-    retriever = Retriever(model_name=args.model, rewrite_llm=args.rewrite_model, device="cuda:0")
+    retriever = Retriever(model_name=args.model, rewrite_llm=args.rewrite_model, rewriting=False, device="cuda:1")
 
+    """""
     with open(args.test_data, "r", encoding="utf-8") as f:
             with open(args.rewrite_test_data, mode="w", encoding="utf-8") as file:
                 for index, line in enumerate(f):
@@ -466,13 +553,31 @@ def main():
                     }
                     file.write(json.dumps(new_data, ensure_ascii=False) + "\n")
                 print("Finish!")
+    """""
 
+    #eval_data, train_data = retriever.split_eval_train_data(args.train_data)
+    #test_data = retriever.load_test_data(args.rewrite_test_data)
 
-    #retriever = Retriever(model_name='IR_Final/retrieval_model/checkpoint-4700', device="cuda:0")
-    #retriever.train(train_data_path=args.train_data , output_model_path=args.output_model, document_path=args.documents, epochs=args.epochs, batch_size=args.batch_size)
+    retriever.train(train_data_path=args.train_data , output_model_path=args.output_model, document_path=args.documents, epochs=args.epochs, batch_size=args.batch_size)
     #retriever.retrieve(args.test_data, args.output_model, args.output_folder, args.documents)
-    retriever.rewrite_bm25(args.rewrite_test_data, args.output_model, args.output_folder, args.documents)
-    #retriever.hybrid(args.test_data, args.output_model, args.output_folder, args.documents)
+    #retriever.rewrite_bm25(eval_data, args.output_model, args.output_folder, args.documents, evaluate=True)
+    data_list = [] 
+
+    with open(args.test_data, 'r', encoding='utf-8') as file1, open(args.rewrite_test_data, 'r', encoding='utf-8') as file2:
+        for line1, line2 in zip(file1, file2):
+            try:
+                data1 = json.loads(line1.strip())
+                data2 = json.loads(line2.strip())
+
+                data1["question"] = (data1["question"] if data1["question"] is not None else "") + "\n" + (data2["context"] if data2["context"] is not None else "")
+                data_list.append(data1)
+            except json.JSONDecodeError:
+                continue
+    print("\n".join([data["question"] for data in data_list if "question" in data]))
+
+    
+    retriever.retrieve(data_list, args.output_model, args.output_folder, args.documents, evaluate=False)
+    #retriever.rerank(data_list, args.output_model, args.output_folder, args.documents)
     
 
 if __name__ == "__main__":
